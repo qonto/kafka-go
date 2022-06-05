@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"reflect"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -174,6 +175,17 @@ func (t *Transport) CloseIdleConnections() {
 func (t *Transport) RoundTrip(ctx context.Context, addr net.Addr, req Request) (Response, error) {
 	p := t.grabPool(addr)
 	defer p.unref()
+
+	if req.ApiKey().String() == "Metadata" && t.SASL != nil && t.SASL.Name() == "AWS_MSK_IAM" {
+		topicsReflect := reflect.Indirect(reflect.ValueOf(req)).Field(0)
+		if topicsReflect.Len() > 0 {
+			topics := reflect.Indirect(reflect.ValueOf(req)).Field(0).Interface().([]string)
+			newTopics := make([]string, len(topics))
+			copy(newTopics, topics)
+			p.addTopics(newTopics)
+		}
+	}
+
 	return p.roundTrip(ctx, req)
 }
 
@@ -291,10 +303,11 @@ type connPool struct {
 	wake   chan event // used to force metadata updates
 	cancel context.CancelFunc
 	// Mutable fields of the connection pool, access must be synchronized.
-	mutex sync.RWMutex
-	conns map[int32]*connGroup // data connections used for produce/fetch/etc...
-	ctrl  *connGroup           // control connections used for metadata requests
-	state atomic.Value         // cached cluster state
+	mutex  sync.RWMutex
+	conns  map[int32]*connGroup // data connections used for produce/fetch/etc...
+	ctrl   *connGroup           // control connections used for metadata requests
+	state  atomic.Value         // cached cluster state
+	topics []string
 }
 
 type connPoolState struct {
@@ -310,6 +323,18 @@ func (p *connPool) grabState() connPoolState {
 
 func (p *connPool) setState(state connPoolState) {
 	p.state.Store(state)
+}
+
+func (p *connPool) addTopics(topics []string) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.topics = append(p.topics, topics...)
+}
+
+func (p *connPool) getTopics() []string {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	return p.topics
 }
 
 func (p *connPool) ref() {
@@ -596,7 +621,7 @@ func (p *connPool) discover(ctx context.Context, wake <-chan event) {
 			p.update(ctx, nil, err)
 		} else {
 			res := make(async, 1)
-			req := &meta.Request{}
+			req := &meta.Request{TopicNames: p.getTopics()}
 			deadline, cancel := context.WithTimeout(ctx, p.metadataTTL)
 			c.reqs <- connRequest{
 				ctx: deadline,
