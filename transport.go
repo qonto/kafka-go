@@ -27,6 +27,13 @@ import (
 	"github.com/segmentio/kafka-go/sasl"
 )
 
+type GlobalTopics struct {
+	sync.RWMutex
+	value []string
+}
+
+var globalTopics GlobalTopics
+
 // Request is an interface implemented by types that represent messages sent
 // from kafka clients to brokers.
 type Request = protocol.Message
@@ -142,6 +149,26 @@ func (t *Transport) CloseIdleConnections() {
 	}
 }
 
+func addTopics(topics []string) {
+	allKeys := make(map[string]bool)
+	for _, item := range globalTopics.value {
+		allKeys[item] = true
+	}
+	for _, item := range topics {
+		if _, ok := allKeys[item]; !ok {
+			globalTopics.Lock()
+			globalTopics.value = append(globalTopics.value, item)
+			globalTopics.Unlock()
+		}
+	}
+}
+
+func getTopics() []string {
+	globalTopics.Lock()
+	defer globalTopics.Unlock()
+	return globalTopics.value
+}
+
 // RoundTrip sends a request to a kafka cluster and returns the response, or an
 // error if no responses were received.
 //
@@ -173,18 +200,17 @@ func (t *Transport) CloseIdleConnections() {
 // features of the kafka protocol, but also provide a more efficient way of
 // managing connections to kafka brokers.
 func (t *Transport) RoundTrip(ctx context.Context, addr net.Addr, req Request) (Response, error) {
-	p := t.grabPool(addr)
-	defer p.unref()
-
 	if req.ApiKey().String() == "Metadata" && t.SASL != nil && t.SASL.Name() == "AWS_MSK_IAM" {
 		topicsReflect := reflect.Indirect(reflect.ValueOf(req)).Field(0)
 		if topicsReflect.Len() > 0 {
 			topics := reflect.Indirect(reflect.ValueOf(req)).Field(0).Interface().([]string)
 			newTopics := make([]string, len(topics))
 			copy(newTopics, topics)
-			p.addTopics(newTopics)
+			addTopics(newTopics)
 		}
 	}
+	p := t.grabPool(addr)
+	defer p.unref()
 
 	return p.roundTrip(ctx, req)
 }
@@ -303,11 +329,10 @@ type connPool struct {
 	wake   chan event // used to force metadata updates
 	cancel context.CancelFunc
 	// Mutable fields of the connection pool, access must be synchronized.
-	mutex  sync.RWMutex
-	conns  map[int32]*connGroup // data connections used for produce/fetch/etc...
-	ctrl   *connGroup           // control connections used for metadata requests
-	state  atomic.Value         // cached cluster state
-	topics []string
+	mutex sync.RWMutex
+	conns map[int32]*connGroup // data connections used for produce/fetch/etc...
+	ctrl  *connGroup           // control connections used for metadata requests
+	state atomic.Value         // cached cluster state
 }
 
 type connPoolState struct {
@@ -323,18 +348,6 @@ func (p *connPool) grabState() connPoolState {
 
 func (p *connPool) setState(state connPoolState) {
 	p.state.Store(state)
-}
-
-func (p *connPool) addTopics(topics []string) {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	p.topics = append(p.topics, topics...)
-}
-
-func (p *connPool) getTopics() []string {
-	p.mutex.Lock()
-	defer p.mutex.Unlock()
-	return p.topics
 }
 
 func (p *connPool) ref() {
@@ -621,7 +634,7 @@ func (p *connPool) discover(ctx context.Context, wake <-chan event) {
 			p.update(ctx, nil, err)
 		} else {
 			res := make(async, 1)
-			req := &meta.Request{TopicNames: p.getTopics()}
+			req := &meta.Request{TopicNames: getTopics()}
 			deadline, cancel := context.WithTimeout(ctx, p.metadataTTL)
 			c.reqs <- connRequest{
 				ctx: deadline,
