@@ -150,22 +150,22 @@ func (t *Transport) CloseIdleConnections() {
 }
 
 func addTopics(topics []string) {
+	globalTopics.Lock()
+	defer globalTopics.Unlock()
 	allKeys := make(map[string]bool)
 	for _, item := range globalTopics.value {
 		allKeys[item] = true
 	}
 	for _, item := range topics {
 		if _, ok := allKeys[item]; !ok {
-			globalTopics.Lock()
 			globalTopics.value = append(globalTopics.value, item)
-			globalTopics.Unlock()
 		}
 	}
 }
 
 func getTopics() []string {
-	globalTopics.Lock()
-	defer globalTopics.Unlock()
+	globalTopics.RLock()
+	defer globalTopics.RUnlock()
 	return globalTopics.value
 }
 
